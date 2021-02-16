@@ -1,0 +1,14 @@
+name: sinkhorn-label-allocation
+channels:
+  - defaults
+  - pytorch
+  - conda-forge
+dependencies:
+  - python >=3.6.10,<=3.9.1
+  - pytorch::pytorch >=1.6.0,<=1.7.1
+  - pytorch::torchvision >=0.7.0,<=0.8.2
+  - pandas =1.2.1
+  - tqdm =4.56.0
+  - fire =0.4.0
+  - scipy
+  - matplotlib
