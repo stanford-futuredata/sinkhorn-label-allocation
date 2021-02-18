@@ -1,5 +1,7 @@
 # Sinkhorn Label Allocation: Semi-Supervised Classification via Annealed Self-Training
 
+[[arXiv preprint]](https://arxiv.org/abs/2102.08622)
+
 <p align="center">
   <img align="middle" src="./assets/schematic.png" alt="Schematic illustration of Sinkhorn Label Allocation" width="80%" />
 </p>
@@ -7,6 +9,17 @@
 Self-training is a standard approach to semi-supervised learning where the learner's own predictions on unlabeled data are used as supervision during training. 
 Sinkhorn Label Allocation (SLA) models this label assignment process as an optimal transportation problem between examples and classes, wherein the cost of assigning an example to a class is mediated by the current predictions of the classifier.
 By efficiently approximating the solutions to these optimization problems using the Sinkhorn-Knopp algorithm, SLA can be used in the inner loop of standard stochastic optimization algorithms such as those used to train modern deep neural network architectures.  
+
+If you've found this repository useful in your own work, please consider citing our paper:
+
+```
+@article{tai2021sinkhorn,
+  author = {Kai Sheng Tai and Peter Bailis and Gregory Valiant},
+  title = {{Sinkhorn Label Allocation: Semi-supervised classification via annealed self-training}},
+  year = {2021},
+  journal = {arXiv:2102.08622},
+}
+```
 
 ## Environment
 
