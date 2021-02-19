@@ -67,7 +67,7 @@ def main(
     torch.cuda.manual_seed_all(seed)
 
     args = dict(locals())
-    pprint.pformat(args)
+    logger.info(pprint.pformat(args))
 
     run_id = datetime.datetime.now().isoformat() if run_id is None else run_id
     output_dir = os.path.join(output_dir, str(run_id))
