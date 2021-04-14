@@ -15,7 +15,6 @@ import re
 import pickle
 import pprint
 import fire
-import random
 
 
 logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s', level=logging.INFO)
@@ -61,7 +60,6 @@ def main(
     # initial setup
     num_batches = num_epochs * batches_per_epoch
 
-    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -127,8 +125,7 @@ def main(
         eval_logger.to_dataframe().to_pickle(os.path.join(output_dir, 'eval.log.pkl'))
 
     trainer = SLASelfTraining(
-        num_epochs=num_epochs,
-        batches_per_epoch=batches_per_epoch,
+        num_iters=num_epochs * batches_per_epoch,
         num_workers=num_workers,
         model_optimizer_ctor=optimizer,
         lr_scheduler_ctor=scheduler,

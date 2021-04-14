@@ -6,6 +6,7 @@
 # Information Processing Systems, 2020
 #
 
+import numpy as np
 import torch
 import torch.optim
 import torch.nn as nn
@@ -64,9 +65,13 @@ class FixMatch(NamedTuple):
             unlabeled_dataset, replacement=True, num_samples=self.num_iters*self.unlabeled_batch_size),
             batch_size=self.unlabeled_batch_size, drop_last=True)
         labeled_loader = DataLoader(
-            labeled_dataset, batch_sampler=labeled_sampler, num_workers=self.num_workers, pin_memory=True)
+            labeled_dataset, batch_sampler=labeled_sampler, num_workers=self.num_workers,
+            worker_init_fn=lambda i: np.random.seed(torch.initial_seed() % 2**32 + i),
+            pin_memory=True)
         unlabeled_loader = DataLoader(
-            unlabeled_dataset, batch_sampler=unlabeled_sampler, num_workers=self.num_workers, pin_memory=True)
+            unlabeled_dataset, batch_sampler=unlabeled_sampler, num_workers=self.num_workers,
+            worker_init_fn=lambda i: np.random.seed(torch.initial_seed() % 2**32 + self.num_workers + i),
+            pin_memory=True)
 
         model.to(device=self.devices[0])
         param_avg = self.param_avg_ctor(model)

@@ -7,7 +7,6 @@
 # https://github.com/google-research/fixmatch/blob/master/third_party/auto_augment/augmentations.py
 # https://github.com/google-research/fixmatch/blob/master/libml/ctaugment.py
 
-import random
 import torch
 import numpy as np
 from PIL import ImageOps, ImageEnhance, Image
@@ -42,7 +41,7 @@ def equalize(img: Image, level: int):
 
 def rotate(img: Image, level: int):
     degrees = _int_parameter(level, 30)
-    if random.random() > 0.5:
+    if np.random.random() > 0.5:
         degrees = -degrees
     return img.rotate(degrees)
 
@@ -54,28 +53,28 @@ def posterize(img: Image, level: int):
 
 def shearx(img: Image, level: int):
     level = _float_parameter(level, 0.3)
-    if random.random() > 0.5:
+    if np.random.random() > 0.5:
         level = -level
     return img.transform(img.size, Image.AFFINE, (1, level, 0, 0, 1, 0))
 
 
 def sheary(img: Image, level: int):
     level = _float_parameter(level, 0.3)
-    if random.random() > 0.5:
+    if np.random.random() > 0.5:
         level = -level
     return img.transform(img.size, Image.AFFINE, (1, 0, 0, level, 1, 0))
 
 
 def translatex(img: Image, level: int):
     level = _int_parameter(level, 10)
-    if random.random() > 0.5:
+    if np.random.random() > 0.5:
         level = -level
     return img.transform(img.size, Image.AFFINE, (1, 0, level, 0, 1, 0))
 
 
 def translatey(img: Image, level: int):
     level = _int_parameter(level, 10)
-    if random.random() > 0.5:
+    if np.random.random() > 0.5:
         level = -level
     return img.transform(img.size, Image.AFFINE, (1, 0, 0, 0, 1, level))
 
@@ -132,7 +131,7 @@ class Maybe(object):
         self.probability = probability
 
     def __call__(self, img):
-        if random.random() < self.probability:
+        if np.random.random() < self.probability:
             img = self.f(img)
         return img
 
@@ -144,9 +143,9 @@ class RandAugment(object):
         self.probability = probability
 
     def __call__(self, img):
-        for op in random.choices(augmentation_ops, k=self.num_ops):
+        for op in np.random.choice(augmentation_ops, self.num_ops):
             level = np.random.randint(1, self.num_levels)
-            if random.random() < self.probability:
+            if np.random.random() < self.probability:
                 img = op(img, level)
         return img
 

@@ -150,8 +150,7 @@ def get_log_upper_bounds(dataset, method='empirical', **kwargs):
 
 class SLASelfTraining(NamedTuple):
     num_workers: int
-    num_epochs: int
-    batches_per_epoch: int
+    num_iters: int
     model_optimizer_ctor: Callable[..., torch.optim.Optimizer]
     lr_scheduler_ctor: Callable
     param_avg_ctor: Callable[..., EMA]
@@ -193,16 +192,20 @@ class SLASelfTraining(NamedTuple):
             unlabeled_dataset: Dataset) -> Generator[Stats, None, Any]:
 
         labeled_sampler = BatchSampler(RandomSampler(
-            labeled_dataset, replacement=True, num_samples=self.batches_per_epoch * self.labeled_batch_size),
+            labeled_dataset, replacement=True, num_samples=self.num_iters * self.labeled_batch_size),
             batch_size=self.labeled_batch_size, drop_last=True)
-        labeled_loader = DataLoader(
-            labeled_dataset, batch_sampler=labeled_sampler, num_workers=self.num_workers, pin_memory=True)
         unlabeled_sampler = BatchSampler(RandomSampler(
             unlabeled_dataset, replacement=True,
-            num_samples=self.batches_per_epoch * self.unlabeled_batch_size),
+            num_samples=self.num_iters * self.unlabeled_batch_size),
             batch_size=self.unlabeled_batch_size, drop_last=True)
+        labeled_loader = DataLoader(
+            labeled_dataset, batch_sampler=labeled_sampler, num_workers=self.num_workers,
+            worker_init_fn=lambda i: np.random.seed(torch.initial_seed() % 2 ** 32 + i),
+            pin_memory=True)
         unlabeled_loader = DataLoader(
-            unlabeled_dataset, batch_sampler=unlabeled_sampler, num_workers=self.num_workers, pin_memory=True)
+            unlabeled_dataset, batch_sampler=unlabeled_sampler, num_workers=self.num_workers,
+            worker_init_fn=lambda i: np.random.seed(torch.initial_seed() % 2 ** 32 + self.num_workers + i),
+            pin_memory=True)
 
         # initialize model and optimizer
         model.to(device=self.devices[0])
@@ -232,68 +235,64 @@ class SLASelfTraining(NamedTuple):
             device=self.devices[0])
 
         # training loop
-        for epoch in range(self.num_epochs):
-            # (1) update model
-            for batch_idx, (b_l, b_u) in enumerate(zip(labeled_loader, unlabeled_loader)):
-                # labeled examples
-                xl, yl = b_l
-                yl = yl.cuda(non_blocking=True)
+        for batch_idx, (b_l, b_u) in enumerate(zip(labeled_loader, unlabeled_loader)):
+            # labeled examples
+            xl, yl = b_l
+            yl = yl.cuda(non_blocking=True)
 
-                # augmented pairs of unlabeled examples
-                (xu1, xu2), idxs = b_u
+            # augmented pairs of unlabeled examples
+            (xu1, xu2), idxs = b_u
 
-                with torch.cuda.amp.autocast(enabled=self.mixed_precision):
-                    x = torch.cat([xl, xu1, xu2]).cuda(non_blocking=True)
-                    if len(self.devices) > 1:
-                        num_blocks = x.shape[0] // xl.shape[0]
-                        x = interleave(x, num_blocks)
-                        out = torch.nn.parallel.data_parallel(
-                            model, x, module_kwargs={'autocast': self.mixed_precision}, device_ids=self.devices)
-                        out = de_interleave(out, num_blocks)
-                    else:
-                        out = model(x, autocast=self.mixed_precision)
-
-                    # compute labels
-                    logp_u = F.log_softmax(out[len(xl):], -1)
-                    nu = logp_u.shape[0] // 2
-                    qu = label_assgn.get_plan(log_p=logp_u[:nu].detach()).to(dtype=torch.float32, device=out.device)
-                    qu = qu[:, :-1]
-
-                    # compute loss
-                    loss_l = F.cross_entropy(out[:len(xl)], yl, reduction='mean')
-                    loss_u = -(qu * logp_u[nu:]).sum(-1).mean()
-                    loss = loss_l + self.unlabeled_weight * loss_u
-
-                    # update plan
-                    rho = self.allocation_schedule(
-                        (epoch * self.batches_per_epoch + batch_idx + 1) /
-                        (self.num_epochs * self.batches_per_epoch))
-                    label_assgn.set_allocation_param(rho)
-                    label_assgn.update_loss_matrix(logp_u[:nu], idxs)
-                    assgn_err, assgn_iters = label_assgn.update()
-
-                optim.zero_grad()
-                if self.mixed_precision:
-                    scaler.scale(loss).backward()
-                    scaler.step(optim)
-                    scaler.update()
+            with torch.cuda.amp.autocast(enabled=self.mixed_precision):
+                x = torch.cat([xl, xu1, xu2]).cuda(non_blocking=True)
+                if len(self.devices) > 1:
+                    num_blocks = x.shape[0] // xl.shape[0]
+                    x = interleave(x, num_blocks)
+                    out = torch.nn.parallel.data_parallel(
+                        model, x, module_kwargs={'autocast': self.mixed_precision}, device_ids=self.devices)
+                    out = de_interleave(out, num_blocks)
                 else:
-                    loss.backward()
-                    optim.step()
-                param_avg.step()
-                scheduler.step()
+                    out = model(x, autocast=self.mixed_precision)
 
-                yield self.Stats(
-                    iter=epoch * self.batches_per_epoch + batch_idx + 1,
-                    loss=loss.cpu().item(),
-                    loss_labeled=loss_l.cpu().item(),
-                    loss_unlabeled=loss_u.cpu().item(),
-                    model=model,
-                    avg_model=param_avg.avg_model,
-                    allocation_param=rho,
-                    optimizer=optim,
-                    scheduler=scheduler,
-                    label_vars=qu,
-                    scaling_vars=label_assgn.v.data,
-                    assgn_err=assgn_err,
-                    assgn_iters=assgn_iters)
+                # compute labels
+                logp_u = F.log_softmax(out[len(xl):], -1)
+                nu = logp_u.shape[0] // 2
+                qu = label_assgn.get_plan(log_p=logp_u[:nu].detach()).to(dtype=torch.float32, device=out.device)
+                qu = qu[:, :-1]
+
+                # compute loss
+                loss_l = F.cross_entropy(out[:len(xl)], yl, reduction='mean')
+                loss_u = -(qu * logp_u[nu:]).sum(-1).mean()
+                loss = loss_l + self.unlabeled_weight * loss_u
+
+                # update plan
+                rho = self.allocation_schedule((batch_idx + 1) / self.num_iters)
+                label_assgn.set_allocation_param(rho)
+                label_assgn.update_loss_matrix(logp_u[:nu], idxs)
+                assgn_err, assgn_iters = label_assgn.update()
+
+            optim.zero_grad()
+            if self.mixed_precision:
+                scaler.scale(loss).backward()
+                scaler.step(optim)
+                scaler.update()
+            else:
+                loss.backward()
+                optim.step()
+            param_avg.step()
+            scheduler.step()
+
+            yield self.Stats(
+                iter=batch_idx + 1,
+                loss=loss.cpu().item(),
+                loss_labeled=loss_l.cpu().item(),
+                loss_unlabeled=loss_u.cpu().item(),
+                model=model,
+                avg_model=param_avg.avg_model,
+                allocation_param=rho,
+                optimizer=optim,
+                scheduler=scheduler,
+                label_vars=qu,
+                scaling_vars=label_assgn.v.data,
+                assgn_err=assgn_err,
+                assgn_iters=assgn_iters)
