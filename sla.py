@@ -1,3 +1,7 @@
+#
+# Self-training with Sinkhorn Label Allocation
+#
+
 import numpy as np
 import logging
 import torch
@@ -15,43 +19,40 @@ logger = logging.getLogger(__name__)
 
 
 class SinkhornLabelAllocation(object):
-    loss_matrix: torch.Tensor
-    u: torch.Tensor
-    v: torch.Tensor
-    log_upper_bounds: torch.Tensor
-    log_Q: torch.Tensor
-    entropy_reg: float
+    cost_matrix: torch.Tensor
+    log_Q: torch.Tensor  # log assignment matrix
+    u: torch.Tensor  # row scaling variables
+    v: torch.Tensor  # column scaling variables
+    log_upper_bounds: torch.Tensor  # log class upper bounds
+    rho: float  # allocation fraction
+    reg: float  # regularization coefficient
     update_tol: float
-    rho: float
 
     def __init__(
             self,
             num_examples: int,
             log_upper_bounds: torch.Tensor,
             allocation_param: float,
-            entropy_reg: float,
+            reg: float,
             update_tol: float,
             device='cpu'):
         self.num_examples = num_examples
         self.num_classes = len(log_upper_bounds)
-
-        self.loss_matrix = torch.zeros(self.num_examples + 1, self.num_classes + 1, device=device)
+        self.cost_matrix = torch.zeros(self.num_examples + 1, self.num_classes + 1, device=device)
         self.u = torch.zeros(self.num_examples + 1, device=device)
         self.v = torch.zeros(self.num_classes + 1, device=device)
-
         self.log_upper_bounds = log_upper_bounds
         self.upper_bounds = torch.exp(log_upper_bounds).to(device)
-        self.entropy_reg = entropy_reg
+        self.reg = reg
         self.update_tol = update_tol
-
         self.set_allocation_param(allocation_param)
         self.reset()
 
     def reset(self):
         self.u.zero_()
         self.v.zero_()
-        self.loss_matrix[:-1, :-1] = np.log(self.num_classes)
-        self.log_Q = F.log_softmax(-self.entropy_reg * self.loss_matrix, -1)
+        self.cost_matrix[:-1, :-1] = np.log(self.num_classes)
+        self.log_Q = F.log_softmax(-self.reg * self.cost_matrix, -1)
 
     def get_plan(self, idxs=None, log_p=None):
         assert (idxs is None or log_p is None)
@@ -61,7 +62,7 @@ class SinkhornLabelAllocation(object):
             return self.log_Q[idxs].exp()
         else:
             z = self.v.repeat(log_p.shape[0], 1)
-            z[:, :-1] += self.entropy_reg * log_p
+            z[:, :-1] += self.reg * log_p
             return F.softmax(z, 1)
 
     def get_assignment(self, idxs=None, log_p=None):
@@ -72,27 +73,27 @@ class SinkhornLabelAllocation(object):
             return torch.argmax(self.log_Q[idxs], 1)
         else:
             z = self.v.repeat(log_p.shape[0], 1)
-            z[:, :-1] += self.entropy_reg * log_p
+            z[:, :-1] += self.reg * log_p
             return torch.argmax(z, 1)
 
     def set_allocation_param(self, val: float):
         self.rho = val
         return self
 
-    def set_loss_matrix(self, loss_matrix: torch.Tensor):
-        self.loss_matrix.copy_(loss_matrix)
-        self.log_Q = -self.entropy_reg * self.loss_matrix + self.u.view(-1, 1) + self.v.view(1, -1)
+    def set_cost_matrix(self, cost_matrix: torch.Tensor):
+        self.cost_matrix.copy_(cost_matrix)
+        self.log_Q = -self.reg * self.cost_matrix + self.u.view(-1, 1) + self.v.view(1, -1)
         return self
 
-    def update_loss_matrix(self, log_p: torch.Tensor, idxs: torch.LongTensor):
-        self.loss_matrix[idxs, :-1] = -log_p.detach()
-        log_Q = -self.entropy_reg * self.loss_matrix[idxs] + self.v.view(1, -1)
+    def update_cost_matrix(self, log_p: torch.Tensor, idxs: torch.LongTensor):
+        self.cost_matrix[idxs, :-1] = -log_p.detach()
+        log_Q = -self.reg * self.cost_matrix[idxs] + self.v.view(1, -1)
         self.u[idxs] = -torch.logsumexp(log_Q, 1)
         self.log_Q[idxs] = log_Q + self.u[idxs].view(-1, 1)
         return self
 
     def update(self):
-        mat = -self.entropy_reg * self.loss_matrix
+        mat = -self.reg * self.cost_matrix
         iters = 0
         mu = 1 - self.upper_bounds.sum()
         rn = 1 + self.num_classes + self.num_examples * (1 - self.rho - mu.clamp(max=0))
@@ -149,19 +150,19 @@ def get_log_upper_bounds(dataset, method='empirical', **kwargs):
 
 
 class SLASelfTraining(NamedTuple):
-    num_workers: int
-    num_iters: int
     model_optimizer_ctor: Callable[..., torch.optim.Optimizer]
     lr_scheduler_ctor: Callable
     param_avg_ctor: Callable[..., EMA]
+    allocation_schedule: Callable[[float], float]
+    num_iters: int
     labeled_batch_size: int
     unlabeled_batch_size: int
     unlabeled_weight: Union[float, Callable]
-    allocation_schedule: Callable[[float], float]
-    entropy_reg: float
+    sinkhorn_reg: float
     update_tol: float
     upper_bound_method: str
     upper_bound_kwargs: dict
+    num_workers: int
     mixed_precision: bool
     devices: Sequence[Union[torch.device, str]]
 
@@ -180,14 +181,12 @@ class SLASelfTraining(NamedTuple):
         assgn_err: float
         assgn_iters: int
 
-    def train(self, model: Classifier, num_classes: int, labeled_dataset: Dataset, unlabeled_dataset: Dataset):
-        return expand_generator(self.train_iter(model, num_classes, labeled_dataset, unlabeled_dataset),
-                                return_only=True)
+    def train(self, model: Classifier, labeled_dataset: Dataset, unlabeled_dataset: Dataset):
+        return expand_generator(self.train_iter(model, labeled_dataset, unlabeled_dataset), return_only=True)
 
     def train_iter(
             self,
             model: Classifier,
-            num_classes: int,
             labeled_dataset: Dataset,
             unlabeled_dataset: Dataset) -> Generator[Stats, None, Any]:
 
@@ -230,7 +229,7 @@ class SLASelfTraining(NamedTuple):
             num_examples=len(unlabeled_dataset),
             log_upper_bounds=log_upper_bounds,
             allocation_param=0.,
-            entropy_reg=self.entropy_reg,
+            reg=self.sinkhorn_reg,
             update_tol=self.update_tol,
             device=self.devices[0])
 
@@ -268,7 +267,7 @@ class SLASelfTraining(NamedTuple):
                 # update plan
                 rho = self.allocation_schedule((batch_idx + 1) / self.num_iters)
                 label_assgn.set_allocation_param(rho)
-                label_assgn.update_loss_matrix(logp_u[:nu], idxs)
+                label_assgn.update_cost_matrix(logp_u[:nu], idxs)
                 assgn_err, assgn_iters = label_assgn.update()
 
             optim.zero_grad()

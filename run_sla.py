@@ -22,40 +22,79 @@ logger = logging.getLogger(__name__)
 
 
 def main(
-        num_workers=8,
-        num_filters=32,
         dataset='cifar10',
         data_path='/tmp/data',
         output_dir='/tmp/sla',
         run_id=None,
-        num_labeled=40,
         seed=1,
+        block_depth=4,
+        num_filters=32,
+        num_labeled=40,
+        sample_mode='label_dist_min1',
         num_epochs=1024,
         batches_per_epoch=1024,
-        checkpoint_interval=1024,
-        snapshot_interval=None,
-        max_checkpoints=25,
-        optimizer='sgd',
+        labeled_batch_size=64,
+        unlabeled_batch_size=64 * 7,
+        unlabeled_weight=1.,
         lr=0.03,
         momentum=0.9,
         nesterov=True,
         weight_decay=5e-4,
         bn_momentum=1e-3,
-        labeled_batch_size=64,
-        unlabeled_batch_size=64*7,
-        unlabeled_weight=1.,
         exp_moving_avg_decay=1e-3,
         allocation_schedule=((0., 1.), (0., 1.)),
-        entropy_reg=100.,
+        sinkhorn_reg=100.,
         update_tol=0.01,
         labeled_aug='weak',
         unlabeled_aug=('weak', 'strong'),
-        whiten=True,
-        sample_mode='label_dist_min1',
         upper_bound_method='empirical',
         upper_bound_kwargs={},
+        checkpoint_interval=1024,
+        max_checkpoints=25,
+        num_workers=4,
         mixed_precision=True,
         devices=('cuda:0',)):
+    """Sinkhorn Label Allocation training.
+
+    Args:
+      dataset: the dataset to use ('cifar10', 'cifar100', 'svhn')
+      data_path: dataset root directory
+      output_dir: directory to save logs and model checkpoints
+      run_id: name for training run (output will be saved under output_dir/run_id)
+      seed: random seed
+      block_depth: WideResNet block depth
+      num_filters: WideResNet base filter count
+      num_labeled: number of labeled examples
+      sample_mode: labeled dataset sampling mode ('equal', 'label_dist', 'label_dist_min1', 'multinomial',
+        'multinomial_min1')
+      num_epochs: number of training epochs
+      batches_per_epoch: number of batches per epoch
+      labeled_batch_size: number of labeled examples per batch
+      unlabeled_batch_size: number of unlabeled examples per batch (total batch size will be
+        labeled_batch_size + 2 * unlabeled_batch_size)
+      unlabeled_weight: weight of unlabeled loss term
+      lr: SGD initial learning rate
+      momentum: SGD momentum parameter
+      nesterov: whether to use SGD with Nesterov acceleration
+      weight_decay: weight decay parameter
+      bn_momentum: batch normalization momentum parameter
+      exp_moving_avg_decay: model parameter exponential moving average decay
+      allocation_schedule: piecewise linear label allocation schedule (first tuple denotes fractions of training time,
+        second tuple denotes allocation fractions)
+      sinkhorn_reg: Sinkhorn entropy regularization parameter (larger values => more accurate approximation but longer
+        time to convergence)
+      update_tol: Sinkhorn iteration termination tolerance
+      labeled_aug: data augmentation mode for labeled examples ('none', 'weak', 'strong', 'weak_noflip',
+        'strong_noflip'). 'strong' augmentation uses RandAugment. 'noflip' disables horizontal flip augmentation.
+      unlabeled_aug: pair of augmentations for unlabeled examples
+      upper_bound_method:
+      upper_bound_kwargs:
+      checkpoint_interval: number of batches between checkpoints
+      max_checkpoints: maximum number of checkpoints to retain
+      num_workers: number of workers per data loader
+      mixed_precision: whether to use mixed precision training
+      devices: list of devices for data parallel training
+    """
 
     # initial setup
     num_batches = num_epochs * batches_per_epoch
@@ -87,13 +126,16 @@ def main(
         raise ValueError('Invalid dataset ' + dataset)
     datasets = dataset_fn(
         data_path, num_labeled, labeled_aug=labeled_aug, unlabeled_aug=unlabeled_aug,
-        sample_mode=sample_mode, whiten=whiten)
+        sample_mode=sample_mode, whiten=True)
 
     model = modules.WideResNet(
-        num_classes=datasets['labeled'].num_classes, bn_momentum=bn_momentum, channels=num_filters)
+        num_classes=datasets['labeled'].num_classes, bn_momentum=bn_momentum,
+        block_depth=block_depth, channels=num_filters)
     optimizer = partial(torch.optim.SGD, lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
     scheduler = partial(utils.WarmupCosineLrScheduler, warmup_iter=0, max_iter=num_batches)
-    evaluator = ModelEvaluator(datasets['test'], labeled_batch_size + unlabeled_batch_size, num_workers)
+    evaluator = ModelEvaluator(
+        datasets['test'], labeled_batch_size + unlabeled_batch_size,
+        num_workers=num_workers, mixed_precision=mixed_precision)
 
     def evaluate(model, avg_model, iter):
         results = evaluator.evaluate(model, device=devices[0])
@@ -134,7 +176,7 @@ def main(
         unlabeled_batch_size=unlabeled_batch_size,
         unlabeled_weight=unlabeled_weight,
         allocation_schedule=utils.PiecewiseLinear(*allocation_schedule),
-        entropy_reg=entropy_reg,
+        sinkhorn_reg=sinkhorn_reg,
         update_tol=update_tol,
         upper_bound_method=upper_bound_method,
         upper_bound_kwargs=upper_bound_kwargs,
@@ -143,19 +185,13 @@ def main(
 
     timer = utils.Timer()
     with tqdm(desc='train', total=num_batches, position=0) as train_pbar:
-        train_iter = utils.Generator(
-            trainer.train_iter(model, datasets['labeled'].num_classes, datasets['labeled'], datasets['unlabeled']))
-        smoothed_loss = utils.ema(0.3, avg_only=True)
-        smoothed_loss.send(None)
-        smoothed_acc = utils.ema(1., avg_only=False)
-        smoothed_acc.send(None)
-        eval_stats = None, None
+        train_iter = utils.Generator(trainer.train_iter(model, datasets['labeled'], datasets['unlabeled']))
+        eval_acc = None
 
         # training loop
         for i, stats in enumerate(train_iter):
             if isinstance(stats, trainer.__class__.Stats):
-                train_pbar.set_postfix(
-                    loss=smoothed_loss.send(stats.loss), eval_acc=eval_stats[0], eval_v=eval_stats[1], refresh=False)
+                train_pbar.set_postfix(loss=stats.loss, eval_acc=eval_acc, refresh=False)
                 train_pbar.update()
                 train_logger.write(
                     loss=stats.loss, loss_labeled=stats.loss_labeled, loss_unlabeled=stats.loss_unlabeled,
@@ -165,21 +201,15 @@ def main(
                     assigned_frac=stats.label_vars.data.sum(-1).mean(),
                     assignment_err=stats.assgn_err, assignment_iters=stats.assgn_iters, time=timer())
 
-                if (checkpoint_interval is not None
-                    and i > 0 and (i + 1) % checkpoint_interval == 0) or (i == num_batches - 1):
-                    eval_acc = evaluate(stats.model, stats.avg_model, i+1)
-                    eval_stats = smoothed_acc.send(eval_acc)
-                    checkpoint(stats.model, stats.avg_model, stats.optimizer, stats.scheduler, i+1)
+                if (checkpoint_interval is not None and i > 0 and (i + 1) % checkpoint_interval == 0) or \
+                        (i == num_batches - 1):
+                    checkpoint(stats.model, stats.avg_model, stats.optimizer, stats.scheduler, i + 1)
+                    eval_acc = evaluate(stats.model, stats.avg_model, i + 1)
                     logger.info('eval acc = %.4f | allocated frac = %.4f | allocation param = %.4f' %
                                 (eval_acc, stats.label_vars.mean(0).sum().cpu().item(), stats.allocation_param))
                     logger.info('assignment err = %.4e | assignment iters = %d' % (stats.assgn_err, stats.assgn_iters))
                     logger.info('batch assignments = {}'.format(stats.label_vars.mean(0).cpu().numpy()))
                     logger.info('scaling vars = {}'.format(stats.scaling_vars.cpu().numpy()))
-
-                # take snapshots that are guaranteed to be preserved
-                if snapshot_interval is not None and i > 0 and (i + 1) % snapshot_interval == 0:
-                    checkpoint(stats.model, stats.avg_model, stats.optimizer,
-                               stats.scheduler, i + 1, 'snapshot-{:08d}.pt')
 
                 train_logger.step()
 

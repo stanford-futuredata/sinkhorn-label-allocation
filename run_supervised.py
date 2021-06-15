@@ -3,7 +3,7 @@ import logging
 import torch
 import modules
 import utils
-from fixmatch import FixMatch
+from supervised import Supervised
 from data import get_cifar10, get_cifar100, get_svhn
 from monitoring import TableLogger
 from evaluation import ModelEvaluator
@@ -24,36 +24,27 @@ logger = logging.getLogger(__name__)
 def main(
         dataset='cifar10',
         data_path='/tmp/data',
-        output_dir='/tmp/fixmatch',
+        output_dir='/tmp/supervised',
         run_id=None,
         seed=1,
         block_depth=4,
         num_filters=32,
-        num_labeled=40,
-        sample_mode='label_dist_min1',
         num_epochs=1024,
         batches_per_epoch=1024,
-        labeled_batch_size=64,
-        unlabeled_batch_size=64 * 7,
-        unlabeled_weight=1.,
+        batch_size=512,
         lr=0.03,
         momentum=0.9,
         nesterov=True,
         weight_decay=5e-4,
         bn_momentum=1e-3,
         exp_moving_avg_decay=1e-3,
-        threshold=0.95,
-        labeled_aug='weak',
-        unlabeled_aug=('weak', 'strong'),
-        dist_alignment=False,
-        dist_alignment_batches=128,
-        dist_alignment_eps=1e-6,
+        augmentation='strong',
         checkpoint_interval=1024,
         max_checkpoints=25,
         num_workers=4,
         mixed_precision=True,
         devices=('cuda:0',)):
-    """FixMatch training.
+    """Supervised training.
 
     Args:
       dataset: the dataset to use ('cifar10', 'cifar100', 'svhn')
@@ -63,28 +54,17 @@ def main(
       seed: random seed
       block_depth: WideResNet block depth
       num_filters: WideResNet base filter count
-      num_labeled: number of labeled examples
-      sample_mode: labeled dataset sampling mode ('equal', 'label_dist', 'label_dist_min1', 'multinomial',
-        'multinomial_min1')
       num_epochs: number of training epochs
       batches_per_epoch: number of batches per epoch
-      labeled_batch_size: number of labeled examples per batch
-      unlabeled_batch_size: number of unlabeled examples per batch (total batch size will be
-        labeled_batch_size + 2 * unlabeled_batch_size)
-      unlabeled_weight: weight of unlabeled loss term
+      batch_size: number of examples per batch
       lr: SGD initial learning rate
       momentum: SGD momentum parameter
       nesterov: whether to use SGD with Nesterov acceleration
       weight_decay: weight decay parameter
       bn_momentum: batch normalization momentum parameter
       exp_moving_avg_decay: model parameter exponential moving average decay
-      threshold: confidence threshold
-      labeled_aug: data augmentation mode for labeled examples ('none', 'weak', 'strong', 'weak_noflip',
-        'strong_noflip'). 'strong' augmentation uses RandAugment. 'noflip' disables horizontal flip augmentation.
-      unlabeled_aug: pair of augmentations for unlabeled examples
-      dist_alignment: whether to apply distribution alignment heuristic
-      dist_alignment_batches: number of batches used to compute moving average of label distribution
-      dist_alignment_eps: smoothing parameter for estimating label distribution
+      augmentation: data augmentation mode ('none', 'weak', 'strong', 'weak_noflip', 'strong_noflip').
+        'strong' augmentation uses RandAugment. 'noflip' disables horizontal flip augmentation.
       checkpoint_interval: number of batches between checkpoints
       max_checkpoints: maximum number of checkpoints to retain
       num_workers: number of workers per data loader
@@ -121,15 +101,14 @@ def main(
     else:
         raise ValueError('Invalid dataset ' + dataset)
     datasets = dataset_fn(
-        data_path, num_labeled, labeled_aug=labeled_aug, unlabeled_aug=unlabeled_aug,
-        sample_mode=sample_mode, whiten=True)
+        data_path, num_labeled=None, labeled_aug=augmentation, whiten=True)
 
     model = modules.WideResNet(
         num_classes=datasets['labeled'].num_classes, bn_momentum=bn_momentum,
         block_depth=block_depth, channels=num_filters)
     optimizer = partial(torch.optim.SGD, lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay)
     scheduler = partial(utils.WarmupCosineLrScheduler, warmup_iter=0, max_iter=num_batches)
-    evaluator = ModelEvaluator(datasets['test'], labeled_batch_size + unlabeled_batch_size, num_workers)
+    evaluator = ModelEvaluator(datasets['test'], batch_size, num_workers)
     param_avg_ctor = partial(modules.EMA, alpha=exp_moving_avg_decay)
 
     def evaluate(model, avg_model, iter):
@@ -161,40 +140,31 @@ def main(
         train_logger.to_dataframe().to_pickle(os.path.join(output_dir, 'train.log.pkl'))
         eval_logger.to_dataframe().to_pickle(os.path.join(output_dir, 'eval.log.pkl'))
 
-    trainer = FixMatch(
+    trainer = Supervised(
         num_iters=num_epochs * batches_per_epoch,
         num_workers=num_workers,
         model_optimizer_ctor=optimizer,
         lr_scheduler_ctor=scheduler,
         param_avg_ctor=param_avg_ctor,
-        labeled_batch_size=labeled_batch_size,
-        unlabeled_batch_size=unlabeled_batch_size,
-        unlabeled_weight=unlabeled_weight,
-        threshold=threshold,
-        dist_alignment=dist_alignment,
-        dist_alignment_batches=dist_alignment_batches,
-        dist_alignment_eps=dist_alignment_eps,
+        batch_size=batch_size,
         mixed_precision=mixed_precision,
         devices=devices)
 
     timer = utils.Timer()
     with tqdm(desc='train', total=num_batches, position=0) as train_pbar:
-        train_iter = utils.Generator(trainer.train_iter(model, datasets['labeled'], datasets['unlabeled']))
+        train_iter = utils.Generator(trainer.train_iter(model, datasets['labeled']))
         eval_acc = None
 
-        # training loop
         for i, stats in enumerate(train_iter):
             train_pbar.set_postfix(loss=stats.loss, eval_acc=eval_acc, refresh=False)
             train_pbar.update()
-            train_logger.write(
-                loss=stats.loss, loss_labeled=stats.loss_labeled, loss_unlabeled=stats.loss_unlabeled,
-                threshold_frac=stats.threshold_frac, time=timer())
+            train_logger.write(loss=stats.loss, time=timer())
 
-            if (checkpoint_interval is not None and i > 0 and (i+1) % checkpoint_interval == 0) or \
-                    (i == num_batches - 1):
+            if (checkpoint_interval is not None and i > 0 and (i+1) % checkpoint_interval == 0) \
+                    or (i == num_batches - 1):
+                eval_acc = evaluate(stats.model, stats.avg_model, i+1)
                 checkpoint(stats.model, stats.avg_model, stats.optimizer, stats.scheduler, i+1)
-                eval_acc = evaluate(stats.model, stats.avg_model, i + 1)
-                logger.info('eval acc = %.4f | allocated frac = %.4f' % (eval_acc, stats.threshold_frac))
+                logger.info('eval acc = %.4f' % eval_acc)
 
             train_logger.step()
 

@@ -20,8 +20,9 @@ class Evaluator(object):
 
 
 class ModelEvaluator(Evaluator):
-    def __init__(self, dataset: Dataset, batch_size: int, num_workers: int):
+    def __init__(self, dataset: Dataset, batch_size: int, num_workers: int, mixed_precision: bool = True):
         self.dataset = dataset
+        self.mixed_precision = mixed_precision
         self.loader = DataLoader(dataset, batch_size, shuffle=False, num_workers=num_workers, drop_last=False)
 
     @property
@@ -35,7 +36,7 @@ class ModelEvaluator(Evaluator):
             self,
             model: Classifier,
             device: Optional[Union[torch.device, str]] = None) -> Generator[dict, None, Evaluator.Result]:
-        with model.as_eval(), torch.no_grad():
+        with model.as_eval(), torch.no_grad(), torch.cuda.amp.autocast(enabled=self.mixed_precision):
             mean_accuracy = 0.
             mean_log_loss = 0.
             for i, (x, y) in enumerate(self.loader):

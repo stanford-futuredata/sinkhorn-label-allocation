@@ -214,7 +214,9 @@ class ResidualBlock(nn.Module):
 
 # adapted from https://github.com/YU1ut/MixMatch-pytorch/blob/master/models/wideresnet.py
 class WideResNet(Classifier):
-    def __init__(self, num_classes, channels=32, block_depth=4, nonlin=nn.LeakyReLU(0.1), bn_momentum=1e-3, output_bias=True):
+    def __init__(
+            self, num_classes, channels=32, block_depth=4,
+            nonlin=nn.LeakyReLU(0.1), bn_momentum=1e-3, output_bias=True):
         super().__init__(num_classes)
         self.channels = channels
         self.block_depth = block_depth

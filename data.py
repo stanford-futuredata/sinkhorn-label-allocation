@@ -24,9 +24,12 @@ def get_cifar10(
         labeled_aug='weak',
         unlabeled_aug='strong',
         sample_mode='label_dist',
-        whiten=False,
+        whiten=True,
         incl_labeled_in_unlabeled=True):
     base_dataset = datasets.CIFAR10(data_root, train=True, download=True)
+    if num_labeled is None:
+        num_labeled = len(base_dataset)
+
     if whiten:
         mean, std = cifar10_mean, cifar10_std
     else:
@@ -61,9 +64,12 @@ def get_cifar100(
         labeled_aug='weak',
         unlabeled_aug='strong',
         sample_mode='label_dist',
-        whiten=False,
+        whiten=True,
         incl_labeled_in_unlabeled=True):
     base_dataset = datasets.CIFAR100(data_root, train=True, download=True)
+    if num_labeled is None:
+        num_labeled = len(base_dataset)
+
     if whiten:
         mean, std = cifar100_mean, cifar100_std
     else:
@@ -96,10 +102,13 @@ def get_svhn(
         num_labeled,
         labeled_aug='weak_noflip',
         unlabeled_aug='strong_noflip',
-        whiten=False,
+        whiten=True,
         sample_mode='label_dist',
         incl_labeled_in_unlabeled=True):
     base_dataset = datasets.SVHN(data_root, split='train', download=True)
+    if num_labeled is None:
+        num_labeled = len(base_dataset)
+
     if whiten:
         mean, std = svhn_mean, svhn_std
     else:
@@ -339,18 +348,6 @@ def get_transform(mean, std, mode):
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
             partial(cutout_tensor, size=16),
-        ])
-
-    if mode == 'half':
-        return transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(size=32,
-                                  padding=4,
-                                  padding_mode='reflect'),
-            Maybe(RandAugment(num_ops=2, num_levels=10), probability=0.5),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std),
-            Maybe(partial(cutout_tensor, size=16), probability=0.5),
         ])
 
     raise ValueError("Invalid mode: {}".format(mode))

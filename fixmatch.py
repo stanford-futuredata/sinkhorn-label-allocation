@@ -23,18 +23,18 @@ def get_labeled_dist(dataset):
 
 
 class FixMatch(NamedTuple):
-    num_workers: int  # number of workers per dataloader
-    num_iters: int
     model_optimizer_ctor: Callable[..., torch.optim.Optimizer]
     lr_scheduler_ctor: Callable
     param_avg_ctor: Callable[..., EMA]
+    num_iters: int
     labeled_batch_size: int
     unlabeled_batch_size: int
     unlabeled_weight: Union[float, Callable]
-    threshold: float
+    threshold: float  # confidence threshold
     dist_alignment: bool  # whether to use the distribution alignment heuristic
     dist_alignment_batches: int  # number of batches used to estimate predicted label distribution
     dist_alignment_eps: float  # small float to avoid zero division
+    num_workers: int  # number of workers per dataloader
     mixed_precision: bool
     devices: Sequence[Union[torch.device, str]]
 
